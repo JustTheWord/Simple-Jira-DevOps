@@ -1,0 +1,184 @@
+---
+variables:
+  DOCKER_REGISTRY: justtheword
+  DOCKER_HOST: tcp://thedockerhost:2375/
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  CACHE_IMAGE_NOTIFICATION: $DOCKER_REGISTRY/notification-service:latest
+  CACHE_IMAGE_SIMPLEJIRA: $DOCKER_REGISTRY/simple-jira-app:latest
+  SONAR_TOKEN: $SONAR_TOKEN
+  SONAR_PROJECT_KEY: $SONAR_PROJECT_KEY
+  SONAR_HOST_URL: $SONAR_HOST_URL
+
+stages:
+  - analyze
+  - build
+  - deploy
+
+.default_branch_rules: &default_branch_rules
+  only:
+    - main
+    - dev
+    - /^SJ-\d+-\S+/
+    - /^feature\/\S+/
+    - /^bugfix\/\S+/
+
+.build_helpers:
+  script: |
+    function changes_detected() {
+        path="$1"
+        if git diff --name-only HEAD^ HEAD | grep -q "^$path"; then
+            return 0
+        else
+            return 1
+        fi
+    }
+
+    function build_docker_image() {
+        local cache_image="$1"
+        local dockerfile="$2"
+        local image_name="$3"
+        local build_context="$4"
+        local env_file="$5"
+
+        echo "Logging into Docker registry"
+        echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin
+        echo "Loading cache image"
+        docker pull "$cache_image" || true
+
+        if [[ "$CI_COMMIT_REF_NAME" == "dev" || "$CI_COMMIT_REF_NAME" == "main" ]]; then
+            tag="latest"
+        else
+            tag="$CI_COMMIT_SHA"
+        fi
+
+        echo "Building Docker image"
+        docker build --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$cache_image" -f "$dockerfile" -t "$image_name:$tag" "$build_context"
+
+        echo "Pushing Docker image"
+        docker push "$image_name:$tag"
+
+        echo "IMAGE_TAG=$tag" > "$env_file"
+        echo "IMAGE_NAME=$image_name" >> "$env_file"
+        echo "Contents of $env_file:"
+        cat "$env_file"
+    }
+
+.build_before_script: &build_before_script
+  before_script:
+    - echo "Cloning the DevOps repository..."
+    - git clone --depth 1 --branch main https://grebegor:$SJ_DEVOPS_TOKEN@gitlab.fel.cvut.cz/grebegor/simple-jira-devops.git
+    - echo "Moving Dockerfile to the root directory..."
+    - mv "simple-jira-devops/dockerfiles/$DOCKERFILE" "$DOCKERFILE"
+    - !reference [.build_helpers, script]
+
+analyze:
+  stage: analyze
+  image: maven:3.8.5-openjdk-17
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - echo "Compiling all modules from the parent directory..."
+    - mvn clean test
+    - echo "Running SonarQube analysis for all modules..."
+    - mvn sonar:sonar -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.token=$SONAR_TOKEN
+  allow_failure: true
+  <<: *default_branch_rules
+
+build_notification:
+  stage: build
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: thedockerhost
+  variables:
+    CACHE_IMAGE: $CACHE_IMAGE_NOTIFICATION
+    DOCKERFILE: NotificationService.Dockerfile
+    IMAGE_NAME: $DOCKER_REGISTRY/notification-service
+    BUILD_CONTEXT: .
+    ENV_FILE: notification_image.env
+  <<: *build_before_script
+  script:
+    - echo "Checking for changes in NotificationService..."
+    - |
+      if changes_detected "NotificationService/"; then
+        echo "Changes detected. Proceeding with Docker build..."
+        build_docker_image "$CACHE_IMAGE" "$DOCKERFILE" "$IMAGE_NAME" "$BUILD_CONTEXT" "$ENV_FILE"
+      else
+        echo "No changes detected. Skipping build."
+      fi
+  artifacts:
+    paths:
+      - notification_image.env
+    expire_in: 1h
+  <<: *default_branch_rules
+
+deploy_notification:
+  stage: deploy
+  image: curlimages/curl:7.88.1
+  needs:
+    - job: build_notification
+      artifacts: true
+  when: on_success
+  script:
+    - echo "Triggering deployment webhook for notification-service..."
+    - |
+      if [ -f notification_image.env ]; then
+        source notification_image.env
+        curl -X POST -H "Authorization: Bearer $DEPLOYMENT_SECRET" \
+           -H "Content-Type: application/json" \
+           -d '{"image": "'"$IMAGE_NAME:$IMAGE_TAG"'", "service": "notification_service"}' \
+           $DEPLOYMENT_WEBHOOK_URL
+      else
+        echo "Notification image environment file not found. Skipping deployment."
+      fi
+  <<: *default_branch_rules
+
+build_simplejira:
+  stage: build
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: thedockerhost
+  variables:
+    CACHE_IMAGE: $CACHE_IMAGE_SIMPLEJIRA
+    DOCKERFILE: SimpleJira.Dockerfile
+    IMAGE_NAME: $DOCKER_REGISTRY/simple-jira-app
+    BUILD_CONTEXT: .
+    ENV_FILE: simplejira_image.env
+  <<: *build_before_script
+  script:
+    - echo "Checking for changes in SimpleJira..."
+    - |
+      if changes_detected "SimpleJira/"; then
+        echo "Changes detected. Proceeding with Docker build..."
+        build_docker_image "$CACHE_IMAGE" "$DOCKERFILE" "$IMAGE_NAME" "$BUILD_CONTEXT" "$ENV_FILE"
+      else
+        echo "No changes detected. Skipping build."
+      fi
+  artifacts:
+    paths:
+      - simplejira_image.env
+    expire_in: 1h
+  <<: *default_branch_rules
+
+deploy_simplejira:
+  stage: deploy
+  image: curlimages/curl:7.88.1
+  needs:
+    - job: build_simplejira
+      artifacts: true
+  when: on_success
+  script:
+    - echo "Triggering deployment webhook for simple-jira-app..."
+    - |
+      if [ -f simplejira_image.env ]; then
+        source simplejira_image.env
+        curl -X POST -H "Authorization: Bearer $DEPLOYMENT_SECRET" \
+           -H "Content-Type: application/json" \
+           -d '{"image": "'"$IMAGE_NAME:$IMAGE_TAG"'", "service": "simple_jira_app"}' \
+           $DEPLOYMENT_WEBHOOK_URL
+      else
+        echo "SimpleJira image environment file not found. Skipping deployment."
+      fi
+  <<: *default_branch_rules
